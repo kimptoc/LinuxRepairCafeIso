@@ -1,0 +1,4 @@
+# Local ISO build inputs/outputs (large, regenerable)
+base/
+out/
+out-*/

@@ -18,7 +18,7 @@ readonly BUILD_DIR="${WORK_DIR}/build"
 readonly SQUASHFS_DIR="${WORK_DIR}/squashfs"
 
 # Default package configuration
-readonly REPO_EXTRA_PACKAGES="mint-meta-codecs cheese wdutch"
+readonly REPO_EXTRA_PACKAGES="mint-meta-codecs mint-meta-xfce xfce4-terminal cheese wdutch nodejs npm curl zram-tools"
 
 # Default MBR image search paths
 readonly -a DEFAULT_MBR_PATHS=(
@@ -157,14 +157,73 @@ copy_preseed_files() {
         die "Failed to copy ${PRESEED_DIR} to ${BUILD_DIR}/preseed"
 }
 
+extract_grub_preamble() {
+    local -r grub_cfg="$1"
+    local -r output_file="$2"
+
+    # Mint's upstream grub.cfg may indent menuentry blocks, so allow leading
+    # whitespace when identifying the boundary between preamble and menu.
+    awk '/^[[:space:]]*menuentry/{exit} {print}' "$grub_cfg" > "$output_file" || \
+        die "Failed to extract grub.cfg preamble from ${grub_cfg}"
+}
+
+sanitize_custom_grub_menu() {
+    local -r grub_cfg="$1"
+    local -r output_file="$2"
+
+    # Treat the custom grub.cfg as a menu fragment. Drop any preamble lines
+    # before the first menuentry so they cannot conflict with the preserved
+    # upstream preamble.
+    awk '
+        BEGIN { seen = 0 }
+        /^[[:space:]]*menuentry[[:space:]]/ { seen = 1 }
+        seen { print }
+    ' "$grub_cfg" > "$output_file" || \
+        die "Failed to sanitize custom grub.cfg from ${grub_cfg}"
+
+    if ! grep -q '^[[:space:]]*menuentry[[:space:]]' "$output_file"; then
+        die "Custom grub.cfg does not contain any menuentry blocks: ${grub_cfg}"
+    fi
+}
+
+log_original_boot_config() {
+    # Diagnostic trail: capture what the upstream ISO actually shipped, so a build
+    # log can be diffed against ours when tracking down EFI boot differences.
+    log "Original boot/grub/grub.cfg preamble (everything before the first menuentry):"
+    awk '/^[[:space:]]*menuentry/{exit} {print}' "${BUILD_DIR}/boot/grub/grub.cfg"
+
+    log "Original ISO build command (.disk/mkisofs), for comparison with our xorriso flags:"
+    if [[ -f "${BUILD_DIR}/.disk/mkisofs" ]]; then
+        cat "${BUILD_DIR}/.disk/mkisofs"
+    else
+        log "  (.disk/mkisofs not present on this ISO)"
+    fi
+}
+
 copy_boot_configs() {
     log "Copying isolinux.cfg"
     cp -a "${PRESEED_DIR}/config/isolinux.cfg" "${BUILD_DIR}/isolinux/" || \
         die "Failed to copy isolinux.cfg to ${BUILD_DIR}/isolinux"
-    
-    log "Copying grub.cfg"
-    cp -a "${PRESEED_DIR}/config/grub.cfg" "${BUILD_DIR}/boot/grub/" || \
-        die "Failed to copy grub.cfg to ${BUILD_DIR}/boot/grub"
+
+    log_original_boot_config
+
+    log "Merging custom grub.cfg onto the original grub.cfg's preamble"
+    local -r orig_grub_cfg="${BUILD_DIR}/boot/grub/grub.cfg"
+    local -r preamble_file="${WORK_DIR}/grub_preamble.cfg"
+    local -r custom_menu_file="${WORK_DIR}/grub_menu.cfg"
+
+    # Keep whatever module loads / terminal+theme setup the upstream grub.cfg had
+    # before its first menuentry. This varies between Mint releases, and our
+    # preseed/config/grub.cfg replaces the whole file rather than extending it -
+    # dropping that preamble can change how grub sets up EFI graphics state before
+    # handing off to the kernel.
+    extract_grub_preamble "$orig_grub_cfg" "$preamble_file"
+    sanitize_custom_grub_menu "${PRESEED_DIR}/config/grub.cfg" "$custom_menu_file"
+
+    cat "$preamble_file" "$custom_menu_file" > "${orig_grub_cfg}.new" || \
+        die "Failed to build merged grub.cfg"
+    mv "${orig_grub_cfg}.new" "$orig_grub_cfg" || \
+        die "Failed to install merged grub.cfg to ${orig_grub_cfg}"
 }
 
 update_iso_checksum() {
@@ -210,8 +269,15 @@ install_packages() {
     log "Installing packages inside chroot: ${SQUASHFS_DIR}"
     chroot "$SQUASHFS_DIR" /bin/bash -c "
         export DEBIAN_FRONTEND=noninteractive
+        apt-get update || exit 1
         apt-get install -y ${packages} || exit 1
     " || die "Failed to install packages inside chroot"
+
+    configure_zram_swap "$SQUASHFS_DIR"
+    install_live_session_selector "$SQUASHFS_DIR"
+    install_kilocode_cli "$SQUASHFS_DIR"
+    install_kilocode_launchers "$SQUASHFS_DIR"
+    remove_desktop_install_launcher "$SQUASHFS_DIR"
 
     log "Unmounting /dev, /proc, /sys inside chroot: ${SQUASHFS_DIR}"
     umount "$SQUASHFS_DIR/dev"             || die "Failed to unmount /dev"
@@ -229,6 +295,255 @@ install_packages() {
     
     # Clean up
     rm -rf "$SQUASHFS_DIR"
+}
+
+configure_zram_swap() {
+    local -r rootfs="$1"
+
+    log "Configuring zram swap"
+
+    cat > "$rootfs/etc/default/zramswap" <<'EOF'
+# Match the CodeClub live ISO zram setting: compressed swap sized at 50% RAM.
+ALGO=lz4
+PERCENT=50
+PRIORITY=100
+EOF
+
+    chroot "$rootfs" /bin/bash -c '
+        systemctl enable zramswap.service >/dev/null 2>&1 || true
+    '
+}
+
+install_live_session_selector() {
+    local -r rootfs="$1"
+
+    log "Installing live session selector"
+
+    mkdir -p \
+        "$rootfs/usr/local/sbin" \
+        "$rootfs/etc/systemd/system"
+
+    cat > "$rootfs/usr/local/sbin/lrc-select-live-session" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+cmdline="$(cat /proc/cmdline)"
+session=""
+
+case " ${cmdline} " in
+    *" lrc_session=xfce "*)
+        session="xfce"
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+
+if [[ ! -f "/usr/share/xsessions/${session}.desktop" ]]; then
+    echo "Requested live session is not installed: ${session}" >&2
+    exit 0
+fi
+
+mkdir -p /etc/lightdm/lightdm.conf.d
+cat > /etc/lightdm/lightdm.conf.d/90-lrc-live-session.conf <<SESSION_EOF
+[Seat:*]
+user-session=${session}
+SESSION_EOF
+EOF
+
+    chmod 755 "$rootfs/usr/local/sbin/lrc-select-live-session"
+
+    cat > "$rootfs/etc/systemd/system/lrc-live-session.service" <<'EOF'
+[Unit]
+Description=Select Linux Repair Cafe live desktop session
+DefaultDependencies=no
+After=local-fs.target
+Before=display-manager.service lightdm.service
+ConditionPathExists=/proc/cmdline
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/lrc-select-live-session
+
+[Install]
+WantedBy=sysinit.target
+EOF
+
+    chroot "$rootfs" /bin/bash -c '
+        systemctl enable lrc-live-session.service >/dev/null 2>&1 || true
+    '
+}
+
+install_kilocode_cli() {
+    local -r rootfs="$1"
+
+    log "Installing KiloCode CLI inside chroot"
+    if chroot "$rootfs" /bin/bash -c '
+        export DEBIAN_FRONTEND=noninteractive
+        export npm_config_audit=false
+        export npm_config_fund=false
+        export npm_config_update_notifier=false
+        npm install -g @kilocode/cli
+    '; then
+        log "KiloCode CLI installed inside chroot"
+    else
+        log "KiloCode CLI install failed inside chroot; live-session fallback will retry"
+    fi
+}
+
+install_kilocode_launchers() {
+    local -r rootfs="$1"
+    local desktop_dir
+    local desktop_file
+
+    log "Installing KiloCode launchers"
+
+    mkdir -p \
+        "$rootfs/usr/local/bin" \
+        "$rootfs/usr/share/applications" \
+        "$rootfs/etc/xdg/autostart" \
+        "$rootfs/etc/skel/Desktop"
+
+    cat > "$rootfs/usr/local/bin/kilocode-install" <<'EOF'
+#!/usr/bin/env bash
+set +e
+
+LOG_FILE="${HOME:-/tmp}/kilocode-install.log"
+NPM_PREFIX="${HOME:-/tmp}/.cache/npm/global"
+
+{
+    echo "KiloCode installer start: $(date)"
+
+    if command -v kilocode >/dev/null 2>&1; then
+        echo "KiloCode already available at: $(command -v kilocode)"
+        exit 0
+    fi
+
+    export NPM_CONFIG_PREFIX="$NPM_PREFIX"
+    export npm_config_audit=false
+    export npm_config_fund=false
+    export npm_config_update_notifier=false
+    export PATH="$NPM_PREFIX/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+    mkdir -p "$NPM_PREFIX"
+
+    echo "Waiting for npm registry network access..."
+    for attempt in $(seq 1 60); do
+        if curl -fsS --max-time 5 -o /dev/null https://registry.npmjs.org/; then
+            echo "Network ready on attempt ${attempt}"
+            break
+        fi
+        sleep 5
+    done
+
+    for attempt in $(seq 1 10); do
+        echo "npm install attempt ${attempt}"
+        if npm install -g @kilocode/cli; then
+            echo "KiloCode installed at: $(command -v kilocode || true)"
+            exit 0
+        fi
+        sleep 15
+    done
+
+    echo "ERROR: KiloCode install failed"
+    exit 1
+} >> "$LOG_FILE" 2>&1
+EOF
+
+    cat > "$rootfs/usr/local/bin/kilocode-wrapper" <<'EOF'
+#!/usr/bin/env bash
+set +e
+
+export NPM_CONFIG_PREFIX="${HOME:-/tmp}/.cache/npm/global"
+export PATH="$NPM_CONFIG_PREFIX/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+
+if ! command -v kilocode >/dev/null 2>&1; then
+    echo "KiloCode is not installed yet. Trying to install it now..."
+    echo "Installer log: ${HOME:-/tmp}/kilocode-install.log"
+    /usr/local/bin/kilocode-install
+fi
+
+if ! command -v kilocode >/dev/null 2>&1; then
+    echo
+    echo "KiloCode is still unavailable."
+    echo "Check ${HOME:-/tmp}/kilocode-install.log, then launch KiloCode again."
+    echo
+    read -r -p "Press Enter to close..."
+    exit 1
+fi
+
+exec kilocode "$@"
+EOF
+
+    chmod 755 "$rootfs/usr/local/bin/kilocode-install" \
+              "$rootfs/usr/local/bin/kilocode-wrapper"
+
+    cat > "$rootfs/usr/share/applications/kilocode.desktop" <<'EOF'
+[Desktop Entry]
+Name=KiloCode
+Comment=AI coding assistant
+Exec=x-terminal-emulator -e /usr/local/bin/kilocode-wrapper
+Icon=utilities-terminal
+Terminal=false
+Type=Application
+Categories=Development;
+StartupNotify=true
+EOF
+
+    cat > "$rootfs/etc/xdg/autostart/kilocode-install.desktop" <<'EOF'
+[Desktop Entry]
+Name=Install KiloCode
+Comment=Install KiloCode CLI in the background if needed
+Exec=/usr/local/bin/kilocode-install
+Icon=utilities-terminal
+Terminal=false
+Type=Application
+X-GNOME-Autostart-enabled=true
+EOF
+
+    for desktop_dir in "$rootfs/etc/skel/Desktop"; do
+        mkdir -p "$desktop_dir"
+        desktop_file="$desktop_dir/kilocode.desktop"
+        cp "$rootfs/usr/share/applications/kilocode.desktop" "$desktop_file"
+        chmod 755 "$desktop_file"
+    done
+}
+
+remove_desktop_install_launcher() {
+    local -r rootfs="$1"
+    local removed_count=0
+    local desktop_file
+    local -a known_install_launchers=(
+        "etc/xdg/autostart/ubiquity-mint.desktop"
+        "usr/share/applications/ubiquity.desktop"
+    )
+    local launcher
+
+    log "Removing live desktop installer launchers"
+
+    for launcher in "${known_install_launchers[@]}"; do
+        if [[ -e "${rootfs}/${launcher}" ]]; then
+            log "Removing installer launcher: ${launcher}"
+            rm -f "${rootfs}/${launcher}"
+            removed_count=$((removed_count + 1))
+        fi
+    done
+
+    while IFS= read -r -d '' desktop_file; do
+        if grep -Eiq '^(Exec|Name).*ubiquity|only-ubiquity|automatic-ubiquity|install linux mint' "$desktop_file"; then
+            log "Removing installer launcher: ${desktop_file#"$rootfs"/}"
+            rm -f "$desktop_file"
+            removed_count=$((removed_count + 1))
+        fi
+    done < <(
+        find \
+            "$rootfs/home" \
+            "$rootfs/etc/skel" \
+            -path '*/Desktop/*.desktop' \
+            -type f \
+            -print0 2>/dev/null
+    )
+
+    log "Removed ${removed_count} desktop installer launcher(s)"
 }
 
 update_manifest() {
